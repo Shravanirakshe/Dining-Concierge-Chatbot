@@ -18,17 +18,21 @@ import re
 import os
 import json
 import logging
+from boto3.dynamodb.conditions import Attr
 
 logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
 sqs = boto3.client('sqs')
 sqs_url = os.environ.get('SQS_URL')
+dynamodb = boto3.resource('dynamodb')
 
 min_number = 2
 max_number = 15
 default_cuisines = ['thai', 'chinese', 'mexican', 'italian', 'american']
 
 regex = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+
+dynamodb_table_suggestions = 'user-suggestions'
 
 
 def get_slots(intent_request):
@@ -78,6 +82,7 @@ def validate_date(date):
     except ValueError:
         return False
     
+
 def dining_suggestions(intent_request):
     """
     Manages dialog and fulfillment for the DiningSuggestionsIntent.
@@ -87,7 +92,10 @@ def dining_suggestions(intent_request):
     
     slots = get_slots(intent_request)
     
+
     intent_name = intent_request['sessionState']['intent']['name']
+    userName = slots['userName']['value']['interpretedValue'] if slots['userName'] is not None else None
+    userConfirmation = slots['userConfirmation']['value']['interpretedValue'] if slots['userConfirmation'] is not None else None
     location = slots['location']['value']['interpretedValue'] if slots['location'] is not None else None
     cuisine = slots['cuisine']['value']['interpretedValue'] if slots['cuisine'] is not None else None
     numOfPpl = slots['numberOfPpl']['value']['interpretedValue'] if slots['numberOfPpl'] is not None else None
@@ -102,7 +110,7 @@ def dining_suggestions(intent_request):
         # Perform basic validation on the supplied input slots.
         # Use the elicitSlot dialog action to re-prompt for the first violation detected.
         
-        valid_result = validate_dining_suggestions(location, cuisine, numOfPpl, date, time, phoneNumber, emailAddress)
+        valid_result = validate_dining_suggestions(location, userName, userConfirmation, cuisine, numOfPpl, date, time, phoneNumber, emailAddress)
         logger.info('Validation Result -> {}'.format(valid_result['isValid']))
         if not valid_result['isValid']:
             slots[valid_result['violatedSlot']] = None
@@ -117,16 +125,23 @@ def dining_suggestions(intent_request):
 
         return delegate(output_session_attributes, intent_name, get_slots(intent_request))
 
-    # Send the slot data to SQS queue
-    send_slots_to_sqs(slots)
+    if userConfirmation in [None, 'yes', 'Yes']:
+        # Send the slot data to SQS queue
+        send_slots_to_sqs(slots)
 
-    # Send the closing response back to the user.
-    logger.debug('Closing the intent as its fulfilled')
-    return close(intent_request['sessionState']['sessionAttributes'],
-                intent_name,
-                'Fulfilled',
-                {'contentType': 'PlainText',
-                 'content': 'You’re all set. You will receive my suggestions shortly on {}! Happy Dining!'.format(emailAddress)})
+        # Send the closing response back to the user.
+        logger.debug('Closing the intent as its fulfilled')
+        return close(intent_request['sessionState']['sessionAttributes'],
+                    intent_name,
+                    'Fulfilled',
+                    {'contentType': 'PlainText',
+                    'content': 'You’re all set. You will receive my suggestions shortly on {}! Happy Dining!'.format(emailAddress)})
+    else:
+        return close(intent_request['sessionState']['sessionAttributes'],
+                    intent_name,
+                    'Fulfilled',
+                    {'contentType': 'PlainText',
+                    'content': 'You’re all set. Thank you and Happy Dining!'})
 
 
 def delegate(session_attributes, intent_name, slots):
@@ -157,9 +172,18 @@ def close(session_attributes, intent_name, fulfillment_state, message):
         },
         'messages': [message]
     }
-                                 
-   
-def validate_dining_suggestions(location, cuisine, numOfPpl, date, time, phoneNumber,  emailAddress):
+
+def check_user_in_db(userName):
+    dynamodb_table_suggestion = dynamodb.Table(dynamodb_table_suggestions)
+    response = dynamodb_table_suggestion.scan(FilterExpression=Attr('user_id').eq(userName))
+    item = response['Items'][0] if len(response['Items']) > 0 else None
+    if response is None or item is None:
+        return None
+    else:
+        return "["+ str(item['last_suggestions'].split('- [')[1])
+    
+
+def validate_dining_suggestions(location, userName, userConfirmation, cuisine, numOfPpl, date, time, phoneNumber, emailAddress):
     '''
     Function that performs validation for every slot.
     1. Location can only be Manhattan.
@@ -171,98 +195,113 @@ def validate_dining_suggestions(location, cuisine, numOfPpl, date, time, phoneNu
     7. Email address should be valid according to standard convention.
     
     '''
-    if location is None:
-        logger.debug('Location is None')
+    if userName is None:
+        logger.debug('userName is None')
         return build_validation_result(False,
-                                       'location',
-                                       'Okay. Which NYC city area are you looking to dine in?')
-    elif location.lower() != 'manhattan'.lower():
-        logger.debug('Location {} is not valid.'.format(location))
-        return build_validation_result(False,
-                                       'location',
-                                       'I can find you a restaurant in {}, Can you please try again?'.format('Manhattan'))
-    if cuisine is None:
-        logger.debug('Cuisine is None')
-        return build_validation_result(False,
-                                       'cuisine',
-                                       'Okay!, {}. Which cuisine would you want to try?'.format('Manhattan'))
-    elif cuisine.lower() not in default_cuisines:
-        logger.debug('Invalid Cuisine-> {}'.format(cuisine))
-        return build_validation_result(False,
-                                       'cuisine',
-                                       'Sorry, I can\'t find restaurants for {} cuisine. I can find restaurants only for Thai, Chinese, Mexican, Italian and American cuisines. Could you please try cuisine in this list?'.format(cuisine))      
-                                         
-    logger.info('Number of People captured-> {}, Max number of people -> {}'.format(numOfPpl, max_number))
-    numberOfPpl = int(numOfPpl) if numOfPpl is not None else numOfPpl
+                                    'userName',
+                                    'Sure. Firstly can I know your first name?')
 
-    if numberOfPpl is None:
-        logger.debug('numberOfPpl is None')
-        return build_validation_result(False,
-                                       'numberOfPpl',
-                                       'Ok, how many people will be dining together?')
-                                      
-    elif numberOfPpl < min_number or numberOfPpl > max_number:
-        logger.debug('Invalid numberOfPpl-> {}'.format(numberOfPpl))
-        return build_validation_result(False,
-                                       'numberOfPpl',
-                                       'Please enter between a minimum of {} and a maximum of {} people.'.format(min_number, max_number))
-                                       
-    date_obj = datetime.datetime.strptime(date, '%Y-%m-%d').date() if date is not None else None
-    if date is None:
-        logger.debug('Date is None')
-        return build_validation_result(False, 'date', 'Which date do you plan to visit the restaurant?')
-    else:
-        if not validate_date(date):
-            logger.debug('Invalid Date-> {}'.format(date))
-            return build_validation_result(False, 'date', 'I did not understand that, which date do you plan to visit the restaurant?')
-        elif date_obj < datetime.date.today():
-            logger.debug('Date is in the past-> {}'.format(date))
-            return build_validation_result(False, 'date', 'You can\'t reserve your seats in the past. Which date do you plan to visit the restaurant?')
+    elif userConfirmation is None:
+        if not check_user_in_db(userName.lower()) == None:
+                suggestions = check_user_in_db(userName.lower())
+                return build_validation_result(False,
+                                        'userConfirmation',
+                                        'I found these suggestions based on our last communication - {} Do you want new suggestions (Yes/No) ?'.format(suggestions))
 
-    if time is None:
-        logger.debug('Time is None')
-        return build_validation_result(False, 'time', 'And at what time?')
-    else:
-        if len(time) != 5:
-            logger.debug('Invalid Time-> {}'.format(time))
-            return build_validation_result(False, 'time', 'Invalid Time format -> {}. Can you try again?'.format(time))
+    if userConfirmation in [None, 'yes', 'Yes']:
+        if location is None:
+            logger.debug('Location is None')
+            return build_validation_result(False,
+                                            'location',
+                                            'Okay. Which NYC city area are you looking to dine in?')
+        elif location.lower() != 'manhattan'.lower():
+            logger.debug('Location {} is not valid.'.format(location))
+            return build_validation_result(False,
+                                        'location',
+                                        'I can find you a restaurant in {}, Can you please try again?'.format('Manhattan'))
+        if cuisine is None:
+            logger.debug('Cuisine is None')
+            return build_validation_result(False,
+                                        'cuisine',
+                                        'Okay!, {}. Which cuisine would you want to try?'.format('Manhattan'))
+        elif cuisine.lower() not in default_cuisines:
+            logger.debug('Invalid Cuisine-> {}'.format(cuisine))
+            return build_validation_result(False,
+                                        'cuisine',
+                                        'Sorry, I can\'t find restaurants for {} cuisine. I can find restaurants only for Thai, Chinese, Mexican, Italian and American cuisines. Could you please try cuisine in this list?'.format(cuisine))      
+                                            
+        logger.info('Number of People captured-> {}, Max number of people -> {}'.format(numOfPpl, max_number))
+        numberOfPpl = int(numOfPpl) if numOfPpl is not None else numOfPpl
 
-        hour, minute = time.split(':')
-        hour = int(hour)
-        minute = int(minute)
-        if math.isnan(hour) or math.isnan(minute):
-            logger.debug('Invalid Time-> {}'.format(time))
-            return build_validation_result(False, 'time', 'Invalid Time format -> {}. Can you try again?'.format(time))
+        if numberOfPpl is None:
+            logger.debug('numberOfPpl is None')
+            return build_validation_result(False,
+                                        'numberOfPpl',
+                                        'Ok, how many people will be dining together?')
+                                        
+        elif numberOfPpl < min_number or numberOfPpl > max_number:
+            logger.debug('Invalid numberOfPpl-> {}'.format(numberOfPpl))
+            return build_validation_result(False,
+                                        'numberOfPpl',
+                                        'Please enter between a minimum of {} and a maximum of {} people.'.format(min_number, max_number))
+                                        
+        date_obj = datetime.datetime.strptime(date, '%Y-%m-%d').date() if date is not None else None
+        if date is None:
+            logger.debug('Date is None')
+            return build_validation_result(False, 'date', 'Which date do you plan to visit the restaurant?')
+        else:
+            if not validate_date(date):
+                logger.debug('Invalid Date-> {}'.format(date))
+                return build_validation_result(False, 'date', 'I did not understand that, which date do you plan to visit the restaurant?')
+            elif date_obj < datetime.date.today():
+                logger.debug('Date is in the past-> {}'.format(date))
+                return build_validation_result(False, 'date', 'You can\'t reserve your seats in the past. Which date do you plan to visit the restaurant?')
 
-        time_obj = datetime.datetime.strptime(time, '%H:%M').time()
-        combined_datetime = datetime.datetime.combine(date_obj, time_obj)
-        if combined_datetime < datetime.datetime.now():
-            # Time is in the past
-            logger.debug('Time is in the past-> {}'.format(time))
-            return build_validation_result(False, 'time', 'You can\'t reserve your seats in the past. Can you give me a time in the future?')
+        if time is None:
+            logger.debug('Time is None')
+            return build_validation_result(False, 'time', 'And at what time?')
+        else:
+            if len(time) != 5:
+                logger.debug('Invalid Time-> {}'.format(time))
+                return build_validation_result(False, 'time', 'Invalid Time format -> {}. Can you try again?'.format(time))
 
-            
-    logger.info('Phone Number -> {}'.format(phoneNumber))
-    if phoneNumber is None:
-        logger.debug('Phone Pumber is None')
-        return build_validation_result(False,
-                                       'phoneNumber',
-                                       'Could you provide me with your phone number?')
-    elif len(phoneNumber) != 10:
-        logger.debug('Invalid Phone Pumber-> {}'.format(phoneNumber))
-        return build_validation_result(False,
-                                       'phoneNumber',
-                                       'Please enter a valid 10-digit phone number.')
-    if emailAddress is None:
-        logger.debug('Email Address is None')
-        return build_validation_result(False,
-                                       'emailAddress',
-                                       'Awesome!. Lastly, could you give me your email address so that I can send you my suggestions?')
-    elif (not re.fullmatch(regex, emailAddress)):
-        logger.debug('Invalid Email Address-> {}'.format(emailAddress))
-        return build_validation_result(False,
-                                       'emailAddress',
-                                       'Please enter a valid email address.')
+            hour, minute = time.split(':')
+            hour = int(hour)
+            minute = int(minute)
+            if math.isnan(hour) or math.isnan(minute):
+                logger.debug('Invalid Time-> {}'.format(time))
+                return build_validation_result(False, 'time', 'Invalid Time format -> {}. Can you try again?'.format(time))
+
+            time_obj = datetime.datetime.strptime(time, '%H:%M').time()
+            combined_datetime = datetime.datetime.combine(date_obj, time_obj)
+            if combined_datetime < datetime.datetime.now():
+                # Time is in the past
+                logger.debug('Time is in the past-> {}'.format(time))
+                return build_validation_result(False, 'time', 'You can\'t reserve your seats in the past. Can you give me a time in the future?')
+
+                
+        logger.info('Phone Number -> {}'.format(phoneNumber))
+        if phoneNumber is None:
+            logger.debug('Phone Pumber is None')
+            return build_validation_result(False,
+                                        'phoneNumber',
+                                        'Could you provide me with your phone number?')
+        elif len(phoneNumber) != 10:
+            logger.debug('Invalid Phone Pumber-> {}'.format(phoneNumber))
+            return build_validation_result(False,
+                                        'phoneNumber',
+                                        'Please enter a valid 10-digit phone number.')
+        if emailAddress is None:
+            logger.debug('Email Address is None')
+            return build_validation_result(False,
+                                        'emailAddress',
+                                        'Awesome!. Lastly, could you give me your email address so that I can send you my suggestions?')
+        elif (not re.fullmatch(regex, emailAddress)):
+            logger.debug('Invalid Email Address-> {}'.format(emailAddress))
+            return build_validation_result(False,
+                                        'emailAddress',
+                                        'Please enter a valid email address.')
+
 
     logger.info('Successfully validated all the slots\n')                                   
     
@@ -282,10 +321,10 @@ def dispatch(intent_request):
     
     if intent_name == 'DiningSuggestionsIntent':
         return dining_suggestions(intent_request)
-
+    
     raise Exception('Intent with this name ' + intent_name + ' is not supported')
 
-                  
+                
 def lambda_handler(event, context):
     """
     Route the incoming request based on intent.

@@ -79,7 +79,7 @@ def query_dynamo_db(restaurant_ids, cuisine, location, numberOfPpl, date, time):
     table = dynamodb.Table(dynamodb_table)
     
     msgToSend = '<strong>Hi there!!! <br>Checkout these top {number_of_suggestions} restaurants suggestions for {cuisine} cuisine in {location} for \
-                {numberOfPpl} people, on {date} at {time} </strong>'.format( number_of_suggestions = number_of_suggestions,
+                {numberOfPpl} people, on {date} at {time} -</strong>'.format( number_of_suggestions = number_of_suggestions,
                 cuisine=cuisine, location=location, numberOfPpl=numberOfPpl, date=date, time=time)
     
     ct = 1            
@@ -104,6 +104,28 @@ def query_dynamo_db(restaurant_ids, cuisine, location, numberOfPpl, date, time):
 
     return msgToSend
 
+def upload_user_data(userName, textMsgToSend):
+
+    suggestion_table = dynamodb.Table('user-suggestions')
+
+    response = suggestion_table.scan(FilterExpression=Attr('user_id').eq(userName))
+    item = response['Items'][0] if len(response['Items']) > 0 else None
+    if response is None or item is None:
+        suggestion_table.put_item(
+        Item = {
+            'user_id': userName,
+            'last_suggestions': textMsgToSend
+        })
+    else:
+        suggestion_table.update_item(
+            Key={'user_id': userName},
+        UpdateExpression="set last_suggestions= :textMsgToSend",
+        ExpressionAttributeValues={
+            ':val': textMsgToSend
+        },
+        ReturnValues="UPDATED_NEW")
+        print("UPDATED USER INFO--")
+
 
 def lambda_handler(event, context):
     
@@ -118,22 +140,27 @@ def lambda_handler(event, context):
         cuisine = msgData['cuisine']['value']['interpretedValue']
         location = msgData['location']['value']['interpretedValue']
         phoneNumber = msgData['phoneNumber']['value']['interpretedValue']
-        emailAddress = msgData['emailAddress']['value']['interpretedValue']
+        emailAddress = msgData['emailAddress']['value']['originalValue']
         numberOfPpl = msgData['numberOfPpl']['value']['interpretedValue']
         date = msgData['date']['value']['interpretedValue']
         time = msgData['time']['value']['interpretedValue']
+        userName = msgData['userName']['value']['interpretedValue']
 
         # Query Elastic Search with the cuisine
         restaurant_ids = query_es(cuisine)
 
         msgToSend = query_dynamo_db(restaurant_ids, cuisine, location, numberOfPpl, date, time)
 
-        print("Sending SMS")
         textMsgToSend = BeautifulSoup(msgToSend)
-        send_sms(textMsgToSend.get_text('\n'), phoneNumber)
+
+        # print("Sending SMS")
+        # send_sms(textMsgToSend.get_text('\n'), phoneNumber)
 
         print("Sending Email")
         send_email(msgToSend, emailAddress)
+
+        # Extra Credit 
+        upload_user_data(userName, textMsgToSend.get_text())
 
         # Delete message from SQS Queue
         receipt_handle = message['ReceiptHandle']
